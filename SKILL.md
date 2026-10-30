@@ -9,6 +9,8 @@ description: Use when searching Hotels.com Taiwan (tw.hotels.com) hotels, checki
 installed every read goes over plain HTTPS with a Chrome TLS fingerprint (DataDome passes it); without it, or for
 `trips` / `saved`, calls go through a background tab of the user's signed-in Edge on CDP 127.0.0.1:9222. Never
 launch Edge; run ONE command at a time. Start with `hotels doctor` (its `http` row says which transport is used).
+The curl_cffi path is budgeted: ~40 requests in 15 min passed, then signed-in requests got 403/429 (measured
+2026-10-30). Never loop; on exit 4 stop and tell the user to wait.
 
 - `hotels suggest <text> --json` -> region_id, name, area, type.
 - `hotels search <dest|regionId> --checkin YYYY-MM-DD --checkout YYYY-MM-DD [--adults 2] [--children 7,4] [--rooms 1]

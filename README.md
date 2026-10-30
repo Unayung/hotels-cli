@@ -11,7 +11,8 @@ Hotels.com talks to one GraphQL endpoint (`POST https://tw.hotels.com/graphql`, 
 It sits behind DataDome. Measured 2026-10-30: Python's own HTTPS gets a 429 captcha page ("身分驗證") on the
 very first request, whatever the cookies; this is fingerprinting, not a rate limit. With
 [curl_cffi](https://github.com/lexiforest/curl_cffi) installed, the CLI impersonates Chrome's TLS fingerprint and
-everything except `trips` / `saved` works over plain HTTPS, no browser needed:
+everything except `trips` / `saved` works over plain HTTPS without a browser, within a small request budget
+(see Limitations):
 
 ```bash
 pip install curl_cffi            # or: sudo pacman -S python-curl_cffi (Arch) - for the python3 that runs `hotels`
@@ -100,8 +101,10 @@ printed) or a numeric region id.
 
 ## Limitations
 
-- Without curl_cffi everything needs Edge on CDP; with it, only `trips` / `saved` do. How long DataDome keeps
-  accepting curl_cffi over a long session is unmeasured (about 40 requests on 2026-10-30, none challenged).
+- Without curl_cffi everything needs Edge on CDP; with it, only `trips` / `saved` do.
+- **curl_cffi has a budget.** Measured 2026-10-30: about 40 requests in 15 minutes passed, then every request
+  carrying the signed-in cookies got 403 / the 429 captcha page, while an anonymous homepage request still got
+  200. Treat it like a small allowance: one command at a time, no loops, and stop on exit 4 instead of retrying.
 - Not verified live: `--stars`, `--free-cancel`, `--breakfast`, `--min/--max`, `--rooms 2`, `--sort rating|distance|stars`,
   currencies other than TWD, `login --from-browser` from a signed-out browser, the 已過去 (past) trips tab.
 - `trips`: this account has no bookings, so only the empty state was seen; a non-empty list returns raw page text.
