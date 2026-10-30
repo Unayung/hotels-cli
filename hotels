@@ -2,8 +2,8 @@
 """
 hotels - agent-native CLI for Hotels.com Taiwan (tw.hotels.com, zh-TW, TWD). No booking.
 
-Python 3.8+ stdlib; optional curl_cffi (Chrome TLS fingerprint, gets past
-DataDome without a browser - see Http). Every command supports --json and
+Python 3.8+ stdlib. Needs the user's Edge on CDP (see CAVEAT); curl_cffi is
+used only for the opt-in `--via http`. Every command supports --json and
 returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
 Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
 
@@ -28,15 +28,23 @@ query text sent):
        "DESKTOP"}, identity:{duaid:<uuid>, authState:"AUTHENTICATED"},
        privacyTrackingState:"CAN_TRACK"}.
 
-  CAVEAT (measured 2026-10-30): Python's urllib gets DataDome's 429 captcha
-  page ("身分驗證") on the very first request, cookies or not - TLS
-  fingerprinting, not a rate limit. curl_cffi impersonating Chrome passes
-  (homepage, graphql typeahead/search, signed-in homepage all 200) as long as
-  the browser's `datadome` cookie is NOT sent: that cookie is bound to the
-  browser's fingerprint, and sending it from curl_cffi gets the captcha again.
-  So with curl_cffi installed every read is plain HTTPS; without it, calls go
-  through a background tab of the real Edge on CDP
-  (`fetch(..., {credentials:'include'})`), which carries Edge's fingerprint.
+  CAVEAT, why every call runs in an Edge tab (measured 2026-10-30):
+  Akamai Bot Manager (cookies _abck, bm_*) scores the client, Expedia's own
+  `botOrNot` decides, and the block is a 429 "身分驗證" page that embeds a
+  DataDome captcha (x-page-id: wildcard-challenge-handler). A new client gets
+  an invalid _abck ("~-1~"); only a browser that runs Akamai's sensor script
+  gets it validated. So:
+    - urllib / old-browser TLS fingerprints: captcha on the first request.
+    - curl_cffi (Chrome TLS, no JS): ~40 requests passed, then every request
+      from this IP + that fingerprint got the captcha, with or without cookies;
+      it was worse, not better, after 30 idle minutes. Sending the browser's own
+      datadome/_abck cookies from curl_cffi got challenged at once and briefly
+      got Edge challenged too.
+    - Lightpanda (runs JS): first page passed, but Akamai's script throws in it
+      and _abck stays "~-1~" - same short-grace outcome expected.
+  Edge, a real browser on the same IP and session, kept working throughout.
+  Hence: Edge tab by default; `--via http` (curl_cffi when installed) is an
+  opt-in for a handful of requests, and never rotate clients to dodge a block.
 
 Operations used (persisted hash : what it's for : client-info surface):
   SearchLocationSuggestions  7e9f99796f276e4e91ae2a01b075372a569557cda0ed1184c594f9eb86d4fff7
@@ -158,7 +166,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-try:  # optional: Chrome TLS fingerprint gets past DataDome without a browser (measured 2026-10-30)
+try:  # optional, only for `--via http`: Chrome TLS fingerprint, short grace before the captcha
     from curl_cffi import requests as cffi
 except ImportError:
     cffi = None
@@ -612,9 +620,9 @@ def is_challenge(code, text):
 
 
 class Http:
-    """Direct HTTPS. With curl_cffi installed it impersonates Chrome's TLS fingerprint and
-    every read works without a browser (measured 2026-10-30). Plain urllib gets DataDome's
-    429 captcha page on the first request, so without curl_cffi `auto` falls back to Edge."""
+    """Plain HTTPS, used only with `--via http`. urllib is challenged on the first request;
+    curl_cffi (Chrome TLS) passes for a short grace (~40 requests on 2026-10-30) and then
+    this IP + fingerprint gets the captcha even without cookies. See the module docstring."""
 
     def __init__(self, st, debug=False):
         self.st, self.debug = st, debug
@@ -658,9 +666,8 @@ class Http:
 
 
 class Client:
-    """HTTP is attempted first (fast path for `raw`/plain pages); GraphQL calls
-    reliably hit a 429 over plain HTTP (measured) and fall back to a CDP
-    background tab, which carries the real browser fingerprint."""
+    """Every call runs in a background tab of the user's Edge (auto/browser) unless
+    `--via http` asks for plain HTTPS (see Http for why that is opt-in)."""
 
     def __init__(self, args, st=None):
         self.args = args
@@ -679,15 +686,12 @@ class Client:
         via = getattr(self.args, "via", "auto")
         if session and not self.st.get("cookies"):
             raise Auth("not signed in - run `hotels login`")
-        if via != "browser":
+        if via == "http":  # opt-in only: non-browser clients get a short grace, then a captcha (see Http)
             code, text = self.http.fetch(method, url, body, headers)
-            if not is_challenge(code, text):
-                return code, text
-            if via == "http":
-                raise Blocked(f"{urllib.parse.urlparse(url).netloc}: bot wall (HTTP {code}). "
-                              "try `--via browser` (measured: plain HTTP is blocked for graphql)")
-            if getattr(self.args, "debug", False):
-                print(f"note: HTTP blocked ({code}), retrying in a background Edge tab", file=sys.stderr)
+            if is_challenge(code, text):
+                raise Blocked(f"{urllib.parse.urlparse(url).netloc}: bot wall (HTTP {code}) on plain HTTPS - "
+                              "drop `--via http` to use the Edge tab; don't retry")
+            return code, text
         return self.browser().fetch(method, url, body, headers)
 
     def gql(self, op, variables, hash_, client_info=CI_SHOP, session=False):
@@ -954,14 +958,16 @@ def cmd_doctor(args):
 
     cl = Client(argparse.Namespace(via="http", debug=args.debug), st)
     try:
+        if args.via != "http":
+            raise Net("skipped (default transport is the Edge tab; `doctor --via http` probes plain HTTPS)")
         code, text = cl.http.fetch("GET", ORIGIN + "/", None, None)
-        how = "curl_cffi (Chrome TLS)" if cffi else "urllib; `pip install curl_cffi` to skip Edge"
-        checks.append(["http", "ok" if code < 400 else ("blocked" if cffi else "-"), f"HTTPS {code} via {how}"])
+        how = "curl_cffi (Chrome TLS)" if cffi else "urllib"
+        checks.append(["http", "ok" if code < 400 else "blocked", f"HTTPS {code} via {how} (opt-in --via http)"])
     except Net as e:
         checks.append(["http", "-", str(e)])
 
-    gq = "graphql (curl_cffi)" if cffi else "graphql (browser tab)"
-    cl2 = Client(argparse.Namespace(via="http" if cffi else "browser", debug=args.debug), st)
+    gq = "graphql (plain HTTPS)" if args.via == "http" else "graphql (browser tab)"
+    cl2 = Client(argparse.Namespace(via="http" if args.via == "http" else "browser", debug=args.debug), st)
     try:
         d = cl2.gql("SearchLocationSuggestions", {
             "context": cl2.context(), "searchLocationCriteria": {"searchTerm": "東京", "lineOfBusiness": "HOTELS",
@@ -1171,11 +1177,6 @@ def cmd_raw(args):
 
 
 # ---------------------------------------------------------------- session
-# With curl_cffi the saved session itself is checked; without it only an Edge tab
-# (carrying Edge's own sign-in) can load the homepage.
-AUTH_VIA = "http" if cffi else "browser"
-
-
 def homepage_login_state(cl):
     """Parse the raw SSR homepage HTML for the signed-in member's display name."""
     code, html = cl.fetch("GET", ORIGIN + "/")
@@ -1243,7 +1244,7 @@ def cmd_login(args):
         cookies, ua = login_from_browser(args)
         src = f"browser {CDP}"
     st = {"cookies": cookies, "ua": ua}
-    cl = Client(argparse.Namespace(via=AUTH_VIA, debug=args.debug, cdp=getattr(args, "cdp", None)), st)
+    cl = Client(argparse.Namespace(via=args.via, debug=args.debug, cdp=getattr(args, "cdp", None)), st)
     try:
         name = homepage_login_state(cl)
     finally:
@@ -1283,7 +1284,7 @@ def cmd_whoami(args):
     st = load_state()
     if not st.get("cookies") or not _signed_in(st["cookies"]):
         raise Auth(st.get("keyring_error") or "not signed in - run `hotels login`")
-    with Client(argparse.Namespace(via=AUTH_VIA, debug=args.debug, cdp=None), st) as cl:
+    with Client(argparse.Namespace(via=args.via, debug=args.debug, cdp=None), st) as cl:
         name = homepage_login_state(cl)
     if not name:
         raise Auth("saved session rejected - the homepage no longer shows a signed-in member")
@@ -1438,8 +1439,8 @@ def build_parser():
     common.add_argument("--json", action="store_true", help="stable {ok, data|error} envelope")
     common.add_argument("--debug", action="store_true", help="dump requests to stderr")
     common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
-                        help="transport: http (plain HTTPS, graphql reliably 429s), "
-                             "browser (Edge background tab), auto (default: try http, fall back)")
+                        help="transport: auto/browser (default: background tab of Edge on CDP), "
+                             "http (opt-in plain HTTPS, curl_cffi if installed; short grace, then captcha)")
     common.add_argument("--cdp", default=None, help=f"CDP endpoint (default {CDP})")
     common.add_argument("--currency", default="TWD", help="currency (default TWD; only TWD measured live)")
     sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)

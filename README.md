@@ -8,26 +8,23 @@ Every command takes `--json` and returns `{ok, data|error}`. Exit codes: 0 ok, 1
 ## Transport
 
 Hotels.com talks to one GraphQL endpoint (`POST https://tw.hotels.com/graphql`, Apollo persisted queries).
-It sits behind DataDome. Measured 2026-10-30: Python's own HTTPS gets a 429 captcha page ("身分驗證") on the
-very first request, whatever the cookies; this is fingerprinting, not a rate limit. With
-[curl_cffi](https://github.com/lexiforest/curl_cffi) installed, the CLI impersonates Chrome's TLS fingerprint and
-everything except `trips` / `saved` works over plain HTTPS without a browser, within a small request budget
-(see Limitations):
+Every call runs inside a background tab of your own signed-in Edge on CDP (`--cdp`, default
+`http://127.0.0.1:9222`; setup below). Tabs are created with `Target.createTarget(background=true)`, never
+focused, and closed afterwards. The CLI never launches a browser. Run one command at a time (several parallel
+background tabs made Edge close itself during testing).
 
-```bash
-pip install curl_cffi            # or: sudo pacman -S python-curl_cffi (Arch) - for the python3 that runs `hotels`
-hotels doctor                    # "http ok ... via curl_cffi (Chrome TLS)"
-```
+**Why a real browser** (measured 2026-10-30): Akamai Bot Manager (`_abck`, `bm_*` cookies) scores each client and
+Expedia's `botOrNot` answers suspicious ones with a 429 "身分驗證" page carrying a DataDome captcha. A new client
+gets an invalid `_abck`; only a browser that runs Akamai's sensor script gets it validated. Python's HTTPS is
+challenged on the first request. [curl_cffi](https://github.com/lexiforest/curl_cffi) (Chrome TLS fingerprint, no
+JS) passed about 40 requests, then this IP + that fingerprint got the captcha on every request, with or without
+cookies, and it got worse, not better, after 30 idle minutes. Lightpanda (runs JS) passed one page, but Akamai's
+script throws in it and `_abck` stays invalid. Edge on the same IP and session kept working throughout. It is a
+bot classifier, not a rate limit, so the fix is a real browser, not waiting or rotating clients.
 
-It never sends the browser's `datadome` cookie: that cookie is bound to the browser's fingerprint, and sending it
-from curl_cffi brings the captcha back (measured; it can also get that cookie flagged in the browser, after which
-the browser has to pass the captcha once on hotels.com).
-
-Without curl_cffi, and always for `trips` / `saved` (they read and click the live page), calls run inside a
-background tab of your own signed-in Edge on CDP (`--cdp`, default `http://127.0.0.1:9222`). Tabs are created with
-`Target.createTarget(background=true)`, never focused, and closed afterwards. Edge must already be running with
-remote debugging on; the CLI never launches a browser. Run one command at a time (several parallel background
-tabs made Edge close itself during testing).
+`--via http` still exists for a handful of plain-HTTPS requests (it uses curl_cffi when installed; `pip install
+curl_cffi`). Expect it to be cut off after a short grace, and never send the browser's `datadome` / `_abck`
+cookies from it: that got Edge challenged too until it passed the check again.
 
 ## Login
 
@@ -51,11 +48,39 @@ hotels whoami | logout
 
 The header must contain `EG_SESSIONTOKEN`. It is saved to `~/.config/hotels/state.json` (0600, `HOTELS_HOME`
 moves it) or the OS keyring with `--keyring`; `HOTELS_COOKIE` overrides both. Before saving, the live homepage
-must show the member name. With curl_cffi that check, `whoami` and all reads use the pasted session itself.
-Without curl_cffi they run in an Edge tab and so see Edge's own session instead. Exit 3 means there is no valid
-session (or it expired): copy a fresh Cookie header and log in again.
+must show the member name. That check, `whoami` and every read run in the Edge tab, so they see Edge's own
+hotels.com sign-in (sign in once in that Edge profile); the saved header is what `--via http` sends. Exit 3 means
+there is no valid session: sign in to hotels.com in that Edge and log in again.
 
-**Edge on CDP 9222 is needed** only without curl_cffi, for `trips` / `saved`, and for `login --from-browser`.
+**Edge on CDP 9222 is needed for every command** (setup: [Browser on CDP 9222](#browser-on-cdp-9222-setup)).
+
+## Browser on CDP 9222 (setup)
+
+The commands listed above as needing Edge drive a background tab in your own browser through the Chrome DevTools
+Protocol, so their requests carry a real browser's fingerprint and sign-in. The CLI never launches a browser;
+start one yourself with remote debugging on:
+
+```bash
+# Linux (Edge; google-chrome / chromium take the same flags)
+microsoft-edge-stable --remote-debugging-port=9222 --user-data-dir="$HOME/.config/microsoft-edge-debug"
+
+# macOS
+"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/Library/Application Support/Microsoft Edge Debug"
+```
+
+- `--user-data-dir` must point at a separate profile: Chromium-based browsers ignore `--remote-debugging-port` on
+  the default profile (Chrome 136+). Sign in to tw.hotels.com once inside this profile; it stays signed in across
+  restarts. If that profile is already open without the flag, quit the browser first: launching again only opens
+  a window in the running instance.
+- Check it: `curl -s http://127.0.0.1:9222/json/version` prints the browser version, and `hotels doctor` shows
+  `cdp ok`. Another port or host: `--cdp http://127.0.0.1:9333` or `HOTELS_CDP=http://127.0.0.1:9333`.
+- `--remote-allow-origins` is not needed: the CLI connects without an `Origin` header (verified 2026-10-30), and
+  leaving it out keeps web pages from connecting. The port listens on 127.0.0.1 only; keep it that way, because
+  anything that can reach it controls the browser and every session in it.
+- The CLI only creates background tabs (`Target.createTarget(background=true)`), never focuses or touches yours,
+  closes its own when done, and blanks rather than closes the last tab so the browser does not quit. Run one
+  command at a time.
 
 ## Commands
 
@@ -101,10 +126,7 @@ printed) or a numeric region id.
 
 ## Limitations
 
-- Without curl_cffi everything needs Edge on CDP; with it, only `trips` / `saved` do.
-- **curl_cffi has a budget.** Measured 2026-10-30: about 40 requests in 15 minutes passed, then every request
-  carrying the signed-in cookies got 403 / the 429 captcha page, while an anonymous homepage request still got
-  200. Treat it like a small allowance: one command at a time, no loops, and stop on exit 4 instead of retrying.
+- Needs Edge on CDP 9222 and a hotels.com sign-in in it. `--via http` is a short-grace opt-in (see Transport).
 - Not verified live: `--stars`, `--free-cancel`, `--breakfast`, `--min/--max`, `--rooms 2`, `--sort rating|distance|stars`,
   currencies other than TWD, `login --from-browser` from a signed-out browser, the 已過去 (past) trips tab.
 - `trips`: this account has no bookings, so only the empty state was seen; a non-empty list returns raw page text.
