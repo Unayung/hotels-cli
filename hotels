@@ -2,7 +2,8 @@
 """
 hotels - agent-native CLI for Hotels.com Taiwan (tw.hotels.com, zh-TW, TWD). No booking.
 
-Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+Python 3.8+ stdlib; optional curl_cffi (Chrome TLS fingerprint, gets past
+DataDome without a browser - see Http). Every command supports --json and
 returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
 Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
 
@@ -27,15 +28,15 @@ query text sent):
        "DESKTOP"}, identity:{duaid:<uuid>, authState:"AUTHENTICATED"},
        privacyTrackingState:"CAN_TRACK"}.
 
-  CAVEAT (measured 2026-10-30, confirmed live): plain HTTPS to /graphql is
-  blocked - even forwarding real signed-in session cookies + the exact Edge
-  User-Agent gets HTTP 429 "Provisioned request rate has been exceeded"
-  immediately (not a cookie/UA problem, a network-level block, consistent
-  with the user's note that this site runs DataDome). Every GraphQL call in
-  this CLI therefore goes through a background tab of the real Edge on CDP
-  (`fetch(..., {credentials:'include'})`), which works reliably because it
-  carries the browser's TLS/JS fingerprint. `--via http` is kept for
-  completeness/future re-test but will reliably return exit 4 today.
+  CAVEAT (measured 2026-10-30): Python's urllib gets DataDome's 429 captcha
+  page ("身分驗證") on the very first request, cookies or not - TLS
+  fingerprinting, not a rate limit. curl_cffi impersonating Chrome passes
+  (homepage, graphql typeahead/search, signed-in homepage all 200) as long as
+  the browser's `datadome` cookie is NOT sent: that cookie is bound to the
+  browser's fingerprint, and sending it from curl_cffi gets the captcha again.
+  So with curl_cffi installed every read is plain HTTPS; without it, calls go
+  through a background tab of the real Edge on CDP
+  (`fetch(..., {credentials:'include'})`), which carries Edge's fingerprint.
 
 Operations used (persisted hash : what it's for : client-info surface):
   SearchLocationSuggestions  7e9f99796f276e4e91ae2a01b075372a569557cda0ed1184c594f9eb86d4fff7
@@ -156,6 +157,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+try:  # optional: Chrome TLS fingerprint gets past DataDome without a browser (measured 2026-10-30)
+    from curl_cffi import requests as cffi
+except ImportError:
+    cffi = None
 
 VERSION = "0.1.0"
 CDP = os.environ.get("HOTELS_CDP", "http://127.0.0.1:9222")
@@ -606,9 +612,9 @@ def is_challenge(code, text):
 
 
 class Http:
-    """Direct HTTPS. Measured 2026-10-30: /graphql reliably returns 429 even with a
-    real signed-in session's cookies + matching UA - kept only for --via http/auto's
-    first attempt and for `raw` against plain pages; expect it to fail for graphql."""
+    """Direct HTTPS. With curl_cffi installed it impersonates Chrome's TLS fingerprint and
+    every read works without a browser (measured 2026-10-30). Plain urllib gets DataDome's
+    429 captcha page on the first request, so without curl_cffi `auto` falls back to Edge."""
 
     def __init__(self, st, debug=False):
         self.st, self.debug = st, debug
@@ -624,6 +630,20 @@ class Http:
         data = body.encode() if isinstance(body, str) else body
         if self.debug:
             print(f"> {method} {url} {(body or '')[:300]}", file=sys.stderr)
+        if cffi:
+            # The browser's `datadome` cookie is bound to the browser's fingerprint: sent from
+            # curl_cffi it gets the 429 captcha page, while no datadome cookie passes. The UA
+            # must match the impersonated Chrome, so let curl_cffi set it.
+            del h["User-Agent"]
+            if ck:
+                h["Cookie"] = "; ".join(p for p in ck.split("; ") if not p.startswith("datadome="))
+            try:
+                r = cffi.request(method, url, headers=h, data=data, impersonate="chrome", timeout=25)
+            except Exception as e:
+                raise Net(f"{urllib.parse.urlparse(url).netloc}: {e}")
+            if self.debug:
+                print(f"< {r.status_code} {r.text[:300]}", file=sys.stderr)
+            return r.status_code, r.text
         req = urllib.request.Request(url, data=data, headers=h, method=method)
         try:
             with urllib.request.urlopen(req, timeout=25) as r:
@@ -926,27 +946,31 @@ def cmd_doctor(args):
         ver = _http_json("/json/version")
         checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')}"])
     except Net as e:
-        checks.append(["cdp", "FAIL", str(e)])
-        payload = err("doctor found problems", EX_NET, checks=checks)
-        return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
+        # Edge is only required without curl_cffi (and for trips / saved)
+        checks.append(["cdp", "-" if cffi else "FAIL", f"{e} (needed for trips/saved)" if cffi else str(e)])
+        if not cffi:
+            payload = err("doctor found problems", EX_NET, checks=checks)
+            return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
 
     cl = Client(argparse.Namespace(via="http", debug=args.debug), st)
     try:
         code, text = cl.http.fetch("GET", ORIGIN + "/", None, None)
-        checks.append(["http", "ok" if code < 400 else "blocked", f"plain HTTPS {code} (graphql is expected to 429)"])
+        how = "curl_cffi (Chrome TLS)" if cffi else "urllib; `pip install curl_cffi` to skip Edge"
+        checks.append(["http", "ok" if code < 400 else ("blocked" if cffi else "-"), f"HTTPS {code} via {how}"])
     except Net as e:
         checks.append(["http", "-", str(e)])
 
-    cl2 = Client(argparse.Namespace(via="browser", debug=args.debug), st)
+    gq = "graphql (curl_cffi)" if cffi else "graphql (browser tab)"
+    cl2 = Client(argparse.Namespace(via="http" if cffi else "browser", debug=args.debug), st)
     try:
         d = cl2.gql("SearchLocationSuggestions", {
             "context": cl2.context(), "searchLocationCriteria": {"searchTerm": "東京", "lineOfBusiness": "HOTELS",
             "isDestination": True, "isGroundTransfersAirport": False, "pageLocation": "ENTRY"}},
             HASH_TYPEAHEAD, CI_LOTUS)
         n = len(parse_suggest(d))
-        checks.append(["graphql (browser tab)", "ok" if n else "FAIL", f"typeahead 東京: {n} suggestion(s)"])
+        checks.append([gq, "ok" if n else "FAIL", f"typeahead 東京: {n} suggestion(s)"])
     except (Net, ApiError) as e:
-        checks.append(["graphql (browser tab)", "FAIL", str(e)])
+        checks.append([gq, "FAIL", str(e)])
     finally:
         cl2.__exit__()
 
@@ -1147,6 +1171,11 @@ def cmd_raw(args):
 
 
 # ---------------------------------------------------------------- session
+# With curl_cffi the saved session itself is checked; without it only an Edge tab
+# (carrying Edge's own sign-in) can load the homepage.
+AUTH_VIA = "http" if cffi else "browser"
+
+
 def homepage_login_state(cl):
     """Parse the raw SSR homepage HTML for the signed-in member's display name."""
     code, html = cl.fetch("GET", ORIGIN + "/")
@@ -1214,7 +1243,7 @@ def cmd_login(args):
         cookies, ua = login_from_browser(args)
         src = f"browser {CDP}"
     st = {"cookies": cookies, "ua": ua}
-    cl = Client(argparse.Namespace(via="browser", debug=args.debug, cdp=getattr(args, "cdp", None)), st)
+    cl = Client(argparse.Namespace(via=AUTH_VIA, debug=args.debug, cdp=getattr(args, "cdp", None)), st)
     try:
         name = homepage_login_state(cl)
     finally:
@@ -1254,7 +1283,7 @@ def cmd_whoami(args):
     st = load_state()
     if not st.get("cookies") or not _signed_in(st["cookies"]):
         raise Auth(st.get("keyring_error") or "not signed in - run `hotels login`")
-    with Client(argparse.Namespace(via="browser", debug=args.debug, cdp=None), st) as cl:
+    with Client(argparse.Namespace(via=AUTH_VIA, debug=args.debug, cdp=None), st) as cl:
         name = homepage_login_state(cl)
     if not name:
         raise Auth("saved session rejected - the homepage no longer shows a signed-in member")

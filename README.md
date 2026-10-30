@@ -8,8 +8,22 @@ Every command takes `--json` and returns `{ok, data|error}`. Exit codes: 0 ok, 1
 ## Transport
 
 Hotels.com talks to one GraphQL endpoint (`POST https://tw.hotels.com/graphql`, Apollo persisted queries).
-Plain HTTPS gets HTTP 429 even with real cookies (measured 2026-10-30), so every call runs inside a background
-tab of your own signed-in Edge on CDP (`--cdp`, default `http://127.0.0.1:9222`). Tabs are created with
+It sits behind DataDome. Measured 2026-10-30: Python's own HTTPS gets a 429 captcha page ("身分驗證") on the
+very first request, whatever the cookies; this is fingerprinting, not a rate limit. With
+[curl_cffi](https://github.com/lexiforest/curl_cffi) installed, the CLI impersonates Chrome's TLS fingerprint and
+everything except `trips` / `saved` works over plain HTTPS, no browser needed:
+
+```bash
+pip install curl_cffi            # or: sudo pacman -S python-curl_cffi (Arch) - for the python3 that runs `hotels`
+hotels doctor                    # "http ok ... via curl_cffi (Chrome TLS)"
+```
+
+It never sends the browser's `datadome` cookie: that cookie is bound to the browser's fingerprint, and sending it
+from curl_cffi brings the captcha back (measured; it can also get that cookie flagged in the browser, after which
+the browser has to pass the captcha once on hotels.com).
+
+Without curl_cffi, and always for `trips` / `saved` (they read and click the live page), calls run inside a
+background tab of your own signed-in Edge on CDP (`--cdp`, default `http://127.0.0.1:9222`). Tabs are created with
 `Target.createTarget(background=true)`, never focused, and closed afterwards. Edge must already be running with
 remote debugging on; the CLI never launches a browser. Run one command at a time (several parallel background
 tabs made Edge close itself during testing).
@@ -35,13 +49,12 @@ hotels whoami | logout
 ```
 
 The header must contain `EG_SESSIONTOKEN`. It is saved to `~/.config/hotels/state.json` (0600, `HOTELS_HOME`
-moves it) or the OS keyring with `--keyring`; `HOTELS_COOKIE` overrides both. Hotels.com blocks plain HTTPS, so
-the check before saving (the live homepage must show the member name) and every later request, `whoami`
-included, run inside a background tab of Edge and therefore see that Edge's own session; the saved header
-mainly records which account you meant and feeds `--via http`. Exit 3 means there is no valid session (or it
-expired): sign in to hotels.com in Edge and log in again.
+moves it) or the OS keyring with `--keyring`; `HOTELS_COOKIE` overrides both. Before saving, the live homepage
+must show the member name. With curl_cffi that check, `whoami` and all reads use the pasted session itself.
+Without curl_cffi they run in an Edge tab and so see Edge's own session instead. Exit 3 means there is no valid
+session (or it expired): copy a fresh Cookie header and log in again.
 
-**Edge on CDP 9222 is needed for every request**, including `login` (its check) and `whoami`.
+**Edge on CDP 9222 is needed** only without curl_cffi, for `trips` / `saved`, and for `login --from-browser`.
 
 ## Commands
 
@@ -87,7 +100,8 @@ printed) or a numeric region id.
 
 ## Limitations
 
-- Needs Edge on CDP and a signed-in session; `http` transport reliably 429s.
+- Without curl_cffi everything needs Edge on CDP; with it, only `trips` / `saved` do. How long DataDome keeps
+  accepting curl_cffi over a long session is unmeasured (about 40 requests on 2026-10-30, none challenged).
 - Not verified live: `--stars`, `--free-cancel`, `--breakfast`, `--min/--max`, `--rooms 2`, `--sort rating|distance|stars`,
   currencies other than TWD, `login --from-browser` from a signed-out browser, the 已過去 (past) trips tab.
 - `trips`: this account has no bookings, so only the empty state was seen; a non-empty list returns raw page text.
