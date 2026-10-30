@@ -106,7 +106,10 @@ responses: a search result's own `cardLink.resource.value` is the exact
 URL `hotel`/`price` accept.
 
 Login / account (never passwords/OTP; cookie-only):
-  `hotels login` (default --from-browser) copies tw.hotels.com /
+  `hotels login` takes a DevTools `Cookie:` request header: from stdin when
+  piped, else from the clipboard (exit 2 + instructions if the clipboard holds
+  no hotels.com Cookie header). Also --from-clipboard / --cookie-stdin.
+  `hotels login --from-browser` (opt-in) copies tw.hotels.com /
   .hotels.com cookies from Edge on HOTELS_CDP (default 127.0.0.1:9222). The
   decisive cookie is EG_SESSIONTOKEN (measured: present only when the user
   is actually signed in). Verification parses the live homepage HTML
@@ -1187,13 +1190,26 @@ def login_from_browser(args):
         br.close()
 
 
+LOGIN_HOWTO = ("no hotels.com Cookie header found. In the browser: DevTools > Network > click any "
+               "request to tw.hotels.com > Request Headers > copy the `Cookie:` value, "
+               "then run `hotels login` again (or pipe it in)")
+
+
 def cmd_login(args):
-    if args.from_clipboard or args.cookie_stdin:
-        raw = _clipboard() if args.from_clipboard else \
-            (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
+    default = not (args.from_clipboard or args.cookie_stdin or args.from_browser)
+    if default:
+        try:
+            raw = _clipboard() if sys.stdin.isatty() else sys.stdin.read()
+            clean_cookie(raw)
+        except Auth:
+            raise Usage(LOGIN_HOWTO)
+    if default or args.from_clipboard or args.cookie_stdin:
+        if not default:
+            raw = _clipboard() if args.from_clipboard else \
+                (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
         cookies = header_to_cookies(clean_cookie(raw))
         ua = os.environ.get("HOTELS_UA") or DEFAULT_UA
-        src = "clipboard" if args.from_clipboard else "stdin"
+        src = "clipboard" if args.from_clipboard or (default and sys.stdin.isatty()) else "stdin"
     else:
         cookies, ua = login_from_browser(args)
         src = f"browser {CDP}"
@@ -1444,10 +1460,10 @@ def build_parser():
     pc.add_argument("--region-id", default=None)
     pc.set_defaults(fn=cmd_price)
 
-    lg = sub.add_parser("login", parents=[common], help="save a signed-in hotels.com session")
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in hotels.com session (default: Cookie header from stdin or clipboard)")
     g = lg.add_mutually_exclusive_group()
     g.add_argument("--from-browser", action="store_true",
-                   help="(default) copy the session from Edge on CDP; opens the sign-in page if needed")
+                   help="(opt-in) copy the session from Edge on CDP; opens the sign-in page if needed")
     g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
     g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a Cookie header")
     lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in")

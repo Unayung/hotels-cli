@@ -20,12 +20,16 @@ command at a time. Start with `hotels doctor`.
 - `hotels price <id>... --checkin --checkout ...` -> lowest nightly price per hotel.
 - `hotels trips` (read-only booked/saved tabs), `hotels saved list|add|rm <id> [--yes]` (dry run without --yes).
   `add` creates an auto trip named after the city; `rm` removes it again.
-- `hotels login|whoami|logout`, `hotels raw <path>` (GET only).
+- `hotels login|whoami|logout`, `hotels raw <path>` (GET only). Login: never ask for or type passwords, and
+  never ask the user to paste cookies into chat. Tell the user: DevTools > Network > click any tw.hotels.com
+  request > copy the `Cookie:` request header to the clipboard, then run `hotels login` themselves (or pipe it
+  in on stdin). No usable Cookie header = exit 2 with those steps. `--from-browser` is opt-in only. Every
+  hotels command, `login` and `whoami` included, still needs the signed-in Edge on CDP 9222.
 
 Price rules: `price_total` is Hotels.com's own stay total and is the figure to compare hotels by. The API does not
 say whether taxes/fees are included; the total is higher than rate x nights (1-night Taipei: 4,351 vs 5,025).
 Very low nightly rates can be a shared-dorm bed: confirm with `hotels hotel <id>`.
 
 Unverified: `--stars`, `--free-cancel`, `--breakfast`, `--min/--max`, `--rooms 2`, `--sort rating|distance|stars`,
-non-TWD currency, signed-out login flow, past-trips tab, non-empty trips list. Exit 3 = run `hotels login`.
+non-TWD currency, signed-out `--from-browser` login flow, past-trips tab, non-empty trips list. Exit 3 = run `hotels login`.
 NEVER book, hold, or pay; this CLI has no such command.

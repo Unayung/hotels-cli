@@ -14,6 +14,35 @@ tab of your own signed-in Edge on CDP (`--cdp`, default `http://127.0.0.1:9222`)
 remote debugging on; the CLI never launches a browser. Run one command at a time (several parallel background
 tabs made Edge close itself during testing).
 
+## Login
+
+Hotels.com signs in with a password (+ verification code), so the CLI never takes credentials. It logs in with
+the `Cookie` request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `tw.hotels.com` > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `).
+3. Run `hotels login`. It reads the clipboard, or stdin when piped.
+
+```bash
+hotels login                    # Cookie header from stdin (piped) or the clipboard;
+                                #   nothing usable there = exit 2 with these steps
+hotels login --from-clipboard   # clipboard only
+hotels login --cookie-stdin     # paste (hidden) or pipe it
+hotels login --keyring          # store it in the OS keyring instead of the file
+hotels login --from-browser     # opt-in: copy the session from Edge on CDP 9222; if signed out, opens
+                                #   the sign-in page in a background tab (--wait 300)
+hotels whoami | logout
+```
+
+The header must contain `EG_SESSIONTOKEN`. It is saved to `~/.config/hotels/state.json` (0600, `HOTELS_HOME`
+moves it) or the OS keyring with `--keyring`; `HOTELS_COOKIE` overrides both. Hotels.com blocks plain HTTPS, so
+the check before saving (the live homepage must show the member name) and every later request, `whoami`
+included, run inside a background tab of Edge and therefore see that Edge's own session; the saved header
+mainly records which account you meant and feeds `--via http`. Exit 3 means there is no valid session (or it
+expired): sign in to hotels.com in Edge and log in again.
+
+**Edge on CDP 9222 is needed for every request**, including `login` (its check) and `whoami`.
+
 ## Commands
 
 ```bash
@@ -60,7 +89,7 @@ printed) or a numeric region id.
 
 - Needs Edge on CDP and a signed-in session; `http` transport reliably 429s.
 - Not verified live: `--stars`, `--free-cancel`, `--breakfast`, `--min/--max`, `--rooms 2`, `--sort rating|distance|stars`,
-  currencies other than TWD, `login` flow from a signed-out browser, the 已過去 (past) trips tab.
+  currencies other than TWD, `login --from-browser` from a signed-out browser, the 已過去 (past) trips tab.
 - `trips`: this account has no bookings, so only the empty state was seen; a non-empty list returns raw page text.
 - `saved list` only reports empty vs non-empty (raw text). `saved add` puts the hotel in an auto-created trip named
   after the destination; `rm` removes it from that trip.
