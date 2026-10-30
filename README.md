@@ -1,0 +1,69 @@
+# hotels-cli
+
+Agent-native CLI for Hotels.com Taiwan (`tw.hotels.com`, zh-TW, TWD). Zero dependencies (Python 3.8+ stdlib).
+Search, hotel rooms/rates, price checks, login, trips, and favourites. **No booking, no checkout, no payment.**
+
+Every command takes `--json` and returns `{ok, data|error}`. Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+## Transport
+
+Hotels.com talks to one GraphQL endpoint (`POST https://tw.hotels.com/graphql`, Apollo persisted queries).
+Plain HTTPS gets HTTP 429 even with real cookies (measured 2026-10-30), so every call runs inside a background
+tab of your own signed-in Edge on CDP (`--cdp`, default `http://127.0.0.1:9222`). Tabs are created with
+`Target.createTarget(background=true)`, never focused, and closed afterwards. Edge must already be running with
+remote debugging on; the CLI never launches a browser. Run one command at a time (several parallel background
+tabs made Edge close itself during testing).
+
+## Commands
+
+```bash
+hotels doctor
+hotels suggest 心齋橋
+hotels search 心齋橋 --checkin 2026-12-04 --checkout 2026-12-07 --adults 3 --children 7 \
+      [--rooms 1] [--sort price|price-desc|recommended] [--page 1] [--limit 20] --json
+hotels hotel <id|url> --checkin ... --checkout ... --adults 3 --children 7     # alias: rooms
+hotels price <id> <id> ... --checkin ... --checkout ... --adults 3 --children 7
+hotels login | whoami | logout
+hotels trips                       # read-only: booked / saved tabs of /trips
+hotels saved list
+hotels saved add <id> [--yes]      # dry run without --yes
+hotels saved rm  <id> [--yes]
+hotels raw /robots.txt             # GET only
+```
+
+`--children` takes ages (`7,4`). A destination is free text (resolved through the typeahead, matched region is
+printed) or a numeric region id.
+
+## Prices: read this
+
+- `price_per_night` is Hotels.com's lead (cheapest bookable unit) nightly rate; `price_total` is its own stay total
+  (`總價`) for the same unit. Total is not simply rate x nights.
+- The API does not say whether taxes/fees are included. Example: a 1-night Taipei stay showed NT$4,351/night vs
+  NT$5,025 total. Compare hotels by `price_total`.
+- Budget rows can be a shared-dorm bed rate (e.g. id 134096514 at NT$304/night). Check with `hotels hotel <id>`.
+- Search, `hotel` and `price` agree for the same dates and party (id 59441016: 1,764 / 7,183 in search and hotel;
+  `price` gives 1,764; id 134457477: 1,827 / 8,872 in both).
+- Search drops sponsored cards (only `LodgingCard` rows are kept) and dedupes by id, so price sorts are monotonic.
+
+## Verified live (2026-10-30)
+
+- `search` 心齋橋 (3 nights), 3 adults + 1 child age 7: `--sort price` pages 1/2 ascending, 40 rows, no null
+  prices, 0 overlap; `--sort price-desc` descending, no nulls. Without the child: 368 matches, with the child: 290.
+- `hotel`: rooms with beds, occupancy, rate, total, cancellation ("可全額退款 (11 月 4 日 (三) 前)"), rooms left,
+  check-in/out times.
+- `price` for 3 hotels; `suggest 心齋橋` (region 6223824); `raw /robots.txt`; `doctor`; `whoami`; `trips`.
+- `saved add/rm/list`: add created an auto trip "大阪" holding the hotel; rm removed it and the saved list went
+  back to empty (`尚無儲存項目`).
+- Sanity search 台北 2026-11-20..21, 2 adults: 385 matches.
+
+## Limitations
+
+- Needs Edge on CDP and a signed-in session; `http` transport reliably 429s.
+- Not verified live: `--stars`, `--free-cancel`, `--breakfast`, `--min/--max`, `--rooms 2`, `--sort rating|distance|stars`,
+  currencies other than TWD, `login` flow from a signed-out browser, the 已過去 (past) trips tab.
+- `trips`: this account has no bookings, so only the empty state was seen; a non-empty list returns raw page text.
+- `saved list` only reports empty vs non-empty (raw text). `saved add` puts the hotel in an auto-created trip named
+  after the destination; `rm` removes it from that trip.
+- `hotel` shows the distance-to-landmark text as the area; the API gives no street address or star class.
+- `search` `free_cancellation` was null in every row observed; use `hotel` for cancellation.
+- Persisted-query hashes can rotate when Hotels.com ships a new build.

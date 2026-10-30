@@ -1,0 +1,1496 @@
+#!/usr/bin/env python3
+"""
+hotels - agent-native CLI for Hotels.com Taiwan (tw.hotels.com, zh-TW, TWD). No booking.
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+Endpoints, measured 2026-10-30 with real requests (CDP Network domain on a
+background tab of the user's own signed-in Edge, http://127.0.0.1:9222)
+------------------------------------------------------------------------
+Hotels.com (Expedia Group) is a React/Next SPA that talks to ONE GraphQL
+endpoint for everything, using Apollo persisted queries (sha256Hash, no raw
+query text sent):
+
+  POST https://tw.hotels.com/graphql
+       body: [{"operationName","variables","extensions":{"persistedQuery":
+             {"version":1,"sha256Hash":<hash>}}}]   (always a 1-item ARRAY)
+       headers: content-type: application/json, accept: application/json,
+                multipart/mixed, x-apollo-operation-name, x-apollo-operation-
+                type: query, client-info: "<surface>,<buildHash>,us-west-2"
+                (measured: "lotus-home-ui,...​" for the homepage typeahead,
+                "shopping-pwa,...​" for search/property - both bundle names
+                observed live; the CLI hardcodes the two it uses).
+       variables always carry a `context` object: {siteId:300000045,
+       locale:"zh_TW", eapid:45, tpid:3211, currency:"TWD", device:{type:
+       "DESKTOP"}, identity:{duaid:<uuid>, authState:"AUTHENTICATED"},
+       privacyTrackingState:"CAN_TRACK"}.
+
+  CAVEAT (measured 2026-10-30, confirmed live): plain HTTPS to /graphql is
+  blocked - even forwarding real signed-in session cookies + the exact Edge
+  User-Agent gets HTTP 429 "Provisioned request rate has been exceeded"
+  immediately (not a cookie/UA problem, a network-level block, consistent
+  with the user's note that this site runs DataDome). Every GraphQL call in
+  this CLI therefore goes through a background tab of the real Edge on CDP
+  (`fetch(..., {credentials:'include'})`), which works reliably because it
+  carries the browser's TLS/JS fingerprint. `--via http` is kept for
+  completeness/future re-test but will reliably return exit 4 today.
+
+Operations used (persisted hash : what it's for : client-info surface):
+  SearchLocationSuggestions  7e9f99796f276e4e91ae2a01b075372a569557cda0ed1184c594f9eb86d4fff7
+      typeahead. variables.searchLocationCriteria:{searchTerm,
+      lineOfBusiness:"HOTELS", isDestination:true, isGroundTransfersAirport:
+      false, pageLocation:"ENTRY"}. client-info lotus-home-ui.
+      -> data.searchLocation.itemsGroups[].items[]: primaryText,
+      secondaryText, locationFullName, regionId, geoType, coordinates.
+  SearchResultsAndFilters  2a7915fbb433fda2905166addaea752e01dfea6831ae33d4724cecb783b3c9e0
+      hotel search. client-info shopping-pwa. variables.criteria.primary:
+      {destination:{regionId,regionName}, rooms:[{adults,children:[{age}]}
+      ...], dateRange:{checkInDate/checkOutDate:{year,month,day}}};
+      .secondary.selections: [{id:"sort",value:SORT}, {id:<filterFieldId>,
+      value:<filterValue>}...]; .secondary.counts: [{id:
+      "resultsStartingIndex",value:N}, {id:"resultsSize",value:N<=100}].
+      Works as a FRESH, self-contained query from index 0 (no prior
+      searchId needed) - confirmed live with 0 page-1/page-2 id overlap at
+      startingIndex 0/8 and again 0/100, and with PRICE_LOW_TO_HIGH /
+      PRICE_HIGH_TO_LOW genuinely monotonic (measured: 100/100 non-null,
+      sorted) once SponsoredContentPlacement/ShoppingBanner cards are
+      dropped (kept only __typename=="LodgingCard"; duplicate ids DO occur
+      across the same page - deduped by id).
+      sort enum (measured by clicking every option in the live sort menu):
+        RECOMMENDED(default) PRICE_LOW_TO_HIGH PRICE_HIGH_TO_LOW DISTANCE
+        REVIEW_RELEVANT PROPERTY_CLASS
+      filter ids (measured from the live filter panel's option list):
+        star: "10"/"20"/"30"/"40"/"50" (star*10, repeatable per id for OR)
+        propertyCancellation: "FREE_CANCELLATION"
+        mealPlan: "FREE_BREAKFAST"
+      CAVEAT: children ages verified to change the result set live - same
+      destination/dates, 3 adults no child -> matchedPropertiesSize 411;
+      3 adults + 1 child age 7 -> 293 (fewer properties can host a child).
+  PropertyDetailsBasicQuery  721bc4df6b350b27155218f1a68d92b4098cae7be15ea930deb96c530b5411fc
+      hotel amenities/summary + saveTripItem (favourite) state. client-info
+      shopping-pwa. variables: {context, propertyId, shoppingContext:
+      {multiItem:null,queryTriggeredBy:"OTHER"}, searchCriteria:{primary:
+      {dateRange,destination,rooms}, secondary:{...}}}. No address/star-
+      class field was found in this query's `summary` (only distance-to-
+      landmark text, e.g. "大阪，距離心齋橋 0.3 公里") - the CLI reports that
+      text as `area`, not a street address; this is a real API limitation,
+      not a parsing bug.
+  AtAGlanceQuery  4225c32951fd2d8540d2fb5194c7d4b55fc07f514c6cef1dbdef1507abb25440
+      check-in/out times. client-info shopping-pwa. variables.
+      productIdentifier:{id,type:"PROPERTY_ID",travelSearchCriteria:
+      {property:searchCriteria}}. -> graphicsItemListContents with
+      text:"入住"/subText:"15:00", text:"退房"/subText:"11:00" (measured).
+  RoomsAndRatesPropertyOffersQuery  50e2d8b899e65098905103195ae59b3a7b3aaf76f26110c828a9d913fd3e79e2
+      rooms + rates. client-info shopping-pwa. variables: {context,
+      skipRatePlans:false, propertyId, searchCriteria, shoppingContext,
+      productIdentifier:{id,type,travelSearchCriteria:{property:
+      searchCriteria}}}. -> data.propertyOffers.categorizedListings[]: each
+      unit has header.text (room name), features[].text (size/beds/
+      occupancy/wifi), lodgingReview.rating, secondaryHeader.complexDialog.
+      policyContent.policies[] (cancellation policy text per option, e.g.
+      "不得退款" / "可全額退款" with the refund-by date in
+      policies[].messageSections[].primaryInfo.subheading.text), and
+      primarySelections[0].propertyUnit.ratePlans[]: id, priceDetails[0].
+      price.displayMessages (lead=per-night price, 2nd line="總價 NT$X"=
+      stay total), priceDetails[0].availability.scarcityMessage (rooms
+      left, e.g. "只剩 1 間客房"). When the room can't legally hold the
+      requested party size the API returns a normal 200 with
+      categorizedListings:null and propertyOffers.errorMessage (e.g. "可提
+      供客房無法容納 4 位旅客，請預訂更多間客房") instead of an HTTP error -
+      the CLI surfaces that text as `data.unavailable_reason`, not a crash.
+
+Destination -> regionId, and property URLs, come straight from live
+responses: a search result's own `cardLink.resource.value` is the exact
+URL `hotel`/`price` accept.
+
+Login / account (never passwords/OTP; cookie-only):
+  `hotels login` (default --from-browser) copies tw.hotels.com /
+  .hotels.com cookies from Edge on HOTELS_CDP (default 127.0.0.1:9222). The
+  decisive cookie is EG_SESSIONTOKEN (measured: present only when the user
+  is actually signed in). Verification parses the live homepage HTML
+  (fetched through the same background tab) for
+  `<button title="<name>" ... data-testid="header-menu-button">` - measured
+  live: shows the signed-in member's display name (e.g. "Alex") in the raw
+  SSR HTML once EG_SESSIONTOKEN is set, and a generic label when signed
+  out. If not signed in, the CLI opens https://tw.hotels.com/ in a
+  background tab and clicks the header's 登入 (sign in) button, then polls
+  (--wait, default 300s) for EG_SESSIONTOKEN to appear while the user signs
+  in themselves in that tab. Session saved to ~/.config/hotels/state.json
+  (0600) or the OS keyring (--keyring, chunked). HOTELS_COOKIE overrides.
+`trips` (read-only; measured live on tw.hotels.com/trips: tabs 已預訂/已儲存/
+已過去 - this account currently has 0 of each, so the "已預訂" booking-list
+shape could not be verified with real data; the CLI parses what the page
+renders and reports count 0 plainly rather than inventing a shape).
+`saved add/rm` (favourites = PropertyDetailsBasicQuery's saveTripItem,
+label "儲存"/"已儲存"): the exact save/un-save GraphQL mutation was not
+captured as a distinct network call in the time available (it may be
+batched or debounced client-side); instead the CLI drives the real "將住宿
+儲存到行程裡" button in a background tab and VERIFIES the result by
+re-querying PropertyDetailsBasicQuery's `saveTripItem.initialChecked`
+before and after - never trusts the click alone. Dry-run without --yes.
+
+NEVER called: any /checkout, /book, reservation or payment path.
+
+Unofficial. Undocumented, private API - it can break without warning.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import html as htmllib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+VERSION = "0.1.0"
+CDP = os.environ.get("HOTELS_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://tw.hotels.com"
+GRAPHQL = ORIGIN + "/graphql"
+LOGIN_URL = ORIGIN + "/"
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
+STATE_DIR = os.path.expanduser(os.environ.get("HOTELS_HOME", "~/.config/hotels"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "hotels-cli"
+KR_CHUNK = 4000
+
+CI_LOTUS = "lotus-home-ui,717e25223065c0d31fe38244f43f31dee18e68e3,us-west-2"
+CI_SHOP = "shopping-pwa,c1f42ddf887e47a52e0144e6ac8be2887bfc9f34,us-west-2"
+
+HASH_TYPEAHEAD = "7e9f99796f276e4e91ae2a01b075372a569557cda0ed1184c594f9eb86d4fff7"
+HASH_SEARCH = "2a7915fbb433fda2905166addaea752e01dfea6831ae33d4724cecb783b3c9e0"
+HASH_PROPERTY = "721bc4df6b350b27155218f1a68d92b4098cae7be15ea930deb96c530b5411fc"
+HASH_ATAGLANCE = "4225c32951fd2d8540d2fb5194c7d4b55fc07f514c6cef1dbdef1507abb25440"
+HASH_ROOMS = "50e2d8b899e65098905103195ae59b3a7b3aaf76f26110c828a9d913fd3e79e2"
+
+SORTS = {"recommended": "RECOMMENDED", "price": "PRICE_LOW_TO_HIGH", "price-desc": "PRICE_HIGH_TO_LOW",
+         "distance": "DISTANCE", "rating": "REVIEW_RELEVANT", "stars": "PROPERTY_CLASS"}
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad("" if c is None else c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def nt(v, currency="TWD"):
+    if v is None:
+        return ""
+    sym = "NT$" if currency == "TWD" else currency + " "
+    return f"{sym}{v:,.0f}"
+
+
+def num(text):
+    m = re.search(r"-?[\d,]+(?:\.\d+)?", str(text or ""))
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _http_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). start Edge with --remote-debugging-port=9222")
+
+
+def _set_cdp(cdp):
+    global CDP
+    if cdp:
+        CDP = cdp
+
+
+def edge_cookies():
+    """All hotels.com cookies of the CDP browser (browser-level, no tab needed)."""
+    ver = _http_json("/json/version")
+    b = WS(ver["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    keep = [{"name": c["name"], "value": c["value"], "domain": c["domain"]}
+            for c in cks if "hotels.com" in c.get("domain", "")]
+    return keep, ver.get("User-Agent")
+
+
+class Browser:
+    """One background tab on tw.hotels.com, closed on exit. Never focused."""
+
+    def __init__(self, debug=False, url=ORIGIN + "/", wait=True):
+        self.debug = debug
+        self._url = url
+        self.ver = _http_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _http_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            if wait:
+                self._wait_ready(urllib.parse.urlparse(url).netloc)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def _wait_ready(self, host, limit=30):
+        # measured live (2026-10-30): Target.createTarget's own initial navigation
+        # intermittently lands on chrome-error://chromewebdata (a transient
+        # network hiccup, not a durable DataDome block - plain curl/other tabs
+        # keep working) and never recovers on its own; one Page.navigate retry
+        # to the same URL reliably clears it.
+        t0 = time.time()
+        retried = False
+        while time.time() - t0 < limit:
+            r = self.eval("location.host + '|' + document.readyState")
+            if r and r.startswith(host) and "|loading" not in r:
+                return
+            if r and r.startswith("chromewebdata") and not retried and time.time() - t0 > 4:
+                retried = True
+                try:
+                    self.p.call("Page.navigate", url=self._url)
+                except Net:
+                    pass
+            time.sleep(0.7)
+        raise Net(f"{host} did not load in the background tab (bot check? retried once)")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def navigate(self, url, wait_ready=True):
+        self.p.call("Page.navigate", url=url)
+        if wait_ready:
+            self._wait_ready(urllib.parse.urlparse(url).netloc)
+
+    def fetch(self, method, url, body=None, headers=None):
+        opts = {"method": method, "credentials": "include", "headers": headers or {}}
+        if body is not None:
+            opts["body"] = body
+        js = ("fetch(%s,%s).then(async r=>({http:r.status,text:await r.text()}))"
+              % (json.dumps(url), json.dumps(opts)))
+        r = self.eval(js)
+        return r["http"], r["text"]
+
+    def close(self):
+        # measured live (2026-10-30): real Edge on this CDP port quit (clean
+        # exit 0) twice while this CLI's background tab was the only "page"
+        # target left and got closed - Edge treats zero windows as "last
+        # window closed" and exits. Guard: list live page targets first; if
+        # ours is the only one, navigate it to about:blank and leave it open
+        # (never call Target.closeTarget in that case) instead of closing it.
+        try:
+            targets = self.b.call("Target.getTargets").get("targetInfos", [])
+            pages = [t for t in targets if t.get("type") == "page"]
+            only_page_left = len(pages) <= 1 and any(t.get("targetId") == self.tid for t in pages)
+        except Exception:
+            only_page_left = False  # can't tell -> fall through to closing as before
+        try:
+            if only_page_left:
+                self.p.call("Page.navigate", url="about:blank")
+            else:
+                self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None, acct="default"):
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=hotels-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def keyring_save(cookies):
+    blob = json.dumps(cookies, separators=(",", ":"))
+    parts = [blob[i:i + KR_CHUNK] for i in range(0, len(blob), KR_CHUNK)]
+    for i, part in enumerate(parts):
+        _keyring("set", part, f"default.{i}")
+    return len(parts)
+
+
+def keyring_load(n):
+    parts = [_keyring("get", acct=f"default.{i}") for i in range(n or 0)]
+    if not n or any(p is None for p in parts):
+        raise Auth("saved keyring session is missing - run `hotels login --keyring`")
+    try:
+        return json.loads("".join(parts))
+    except ValueError:
+        raise Auth("saved keyring session is corrupt - run `hotels login --keyring`")
+
+
+def keyring_clear(n):
+    for i in range(max(n or 0, 1)):
+        _keyring("del", acct=f"default.{i}")
+    _keyring("del")
+
+
+def header_to_cookies(header):
+    return [{"name": p.split("=", 1)[0].strip(), "value": p.split("=", 1)[1].strip(), "domain": ".hotels.com"}
+            for p in header.replace("\n", ";").split(";") if "=" in p]
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    except (OSError, ValueError) as e:
+        raise ApiError(f"state file unreadable: {e}")
+    if os.environ.get("HOTELS_COOKIE"):
+        st["cookies"], st["source"] = header_to_cookies(clean_cookie(os.environ["HOTELS_COOKIE"])), "env"
+    elif st.get("cookie_in_keyring"):
+        try:
+            st["cookies"] = keyring_load(st.get("keyring_parts"))
+        except Auth as e:
+            st["cookies"], st["keyring_error"] = [], str(e)
+        st["source"] = "keyring"
+    elif st.get("cookies"):
+        st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k not in ("source", "keyring_error")}
+    if out.get("cookie_in_keyring"):
+        out.pop("cookies", None)
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def cookie_for(cookies, url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    seen, parts = set(), []
+    for c in cookies or []:
+        d = c.get("domain") or ".hotels.com"
+        hit = host == d.lstrip(".") or (d.startswith(".") and host.endswith(d))
+        if hit and c["name"] not in seen:
+            seen.add(c["name"])
+            parts.append(f"{c['name']}={c['value']}")
+    return "; ".join(parts)
+
+
+def clean_cookie(raw):
+    raw = (raw or "").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    pairs = [p.strip() for p in raw.replace("\n", ";").split(";")]
+    good_re = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+=[\x21-\x7e]*$")
+    good = [p for p in pairs if p and good_re.match(p)]
+    bad = [p for p in pairs if p and not good_re.match(p)]
+    if not any(p.startswith("EG_SESSIONTOKEN=") for p in good):
+        preview = raw[:40].encode("ascii", "replace").decode()
+        raise Auth("that does not look like a signed-in hotels.com Cookie header (no "
+                   f"EG_SESSIONTOKEN; starts with {preview!r}). DevTools > Network > a "
+                   "tw.hotels.com request > Request Headers > copy the value of `Cookie`")
+    if bad:
+        print(f"note: dropped {len(bad)} malformed cookie part(s)", file=sys.stderr)
+    return "; ".join(good)
+
+
+def _signed_in(cookies):
+    return any(c["name"] == "EG_SESSIONTOKEN" for c in cookies or [])
+
+
+# -------------------------------------------------------------- transport
+def is_challenge(code, text):
+    head = (text or "")[:2000]
+    return code in (403, 429, 503) and ("Too Many Requests" in head or "<" in head[:200]
+                                        or "Just a moment" in head or "datadome" in head.lower())
+
+
+class Http:
+    """Direct HTTPS. Measured 2026-10-30: /graphql reliably returns 429 even with a
+    real signed-in session's cookies + matching UA - kept only for --via http/auto's
+    first attempt and for `raw` against plain pages; expect it to fail for graphql."""
+
+    def __init__(self, st, debug=False):
+        self.st, self.debug = st, debug
+        self.ua = os.environ.get("HOTELS_UA") or st.get("ua") or DEFAULT_UA
+
+    def fetch(self, method, url, body=None, headers=None):
+        h = {"User-Agent": self.ua, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+             "Origin": ORIGIN, "Referer": ORIGIN + "/"}
+        h.update(headers or {})
+        ck = cookie_for(self.st.get("cookies"), url)
+        if ck:
+            h["Cookie"] = ck
+        data = body.encode() if isinstance(body, str) else body
+        if self.debug:
+            print(f"> {method} {url} {(body or '')[:300]}", file=sys.stderr)
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                code, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise Net(f"{urllib.parse.urlparse(url).netloc}: {e}")
+        if self.debug:
+            print(f"< {code} {text[:300]}", file=sys.stderr)
+        return code, text
+
+
+class Client:
+    """HTTP is attempted first (fast path for `raw`/plain pages); GraphQL calls
+    reliably hit a 429 over plain HTTP (measured) and fall back to a CDP
+    background tab, which carries the real browser fingerprint."""
+
+    def __init__(self, args, st=None):
+        self.args = args
+        self.st = st if st is not None else load_state()
+        self.http = Http(self.st, getattr(args, "debug", False))
+        self.br = None
+        self._duaid = (self.st.get("cookies") and next(
+            (c["value"] for c in self.st["cookies"] if c["name"] == "DUAID"), None)) or str(uuid.uuid4())
+
+    def browser(self):
+        if not self.br:
+            self.br = Browser(getattr(self.args, "debug", False))
+        return self.br
+
+    def fetch(self, method, url, body=None, headers=None, session=False):
+        via = getattr(self.args, "via", "auto")
+        if session and not self.st.get("cookies"):
+            raise Auth("not signed in - run `hotels login`")
+        if via != "browser":
+            code, text = self.http.fetch(method, url, body, headers)
+            if not is_challenge(code, text):
+                return code, text
+            if via == "http":
+                raise Blocked(f"{urllib.parse.urlparse(url).netloc}: bot wall (HTTP {code}). "
+                              "try `--via browser` (measured: plain HTTP is blocked for graphql)")
+            if getattr(self.args, "debug", False):
+                print(f"note: HTTP blocked ({code}), retrying in a background Edge tab", file=sys.stderr)
+        return self.browser().fetch(method, url, body, headers)
+
+    def gql(self, op, variables, hash_, client_info=CI_SHOP, session=False):
+        body = json.dumps([{"operationName": op, "variables": variables,
+                            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": hash_}}}])
+        headers = {"content-type": "application/json", "accept": "application/json, multipart/mixed",
+                   "x-apollo-operation-name": op, "x-apollo-operation-type": "query",
+                   "client-info": client_info}
+        code, text = self.fetch("POST", GRAPHQL, body, headers, session=session)
+        if code == 401:
+            raise Auth(f"{op}: not signed in (HTTP 401) - run `hotels login`")
+        try:
+            d = json.loads(text)
+        except ValueError:
+            raise ApiError(f"{op}: non-JSON reply (HTTP {code})", {"http": code, "body": text[:300]})
+        item = (d[0] if isinstance(d, list) else d) or {}
+        if item.get("errors") and not item.get("data"):
+            raise ApiError(op + ": " + "; ".join(e.get("message", "") for e in item["errors"])[:400],
+                          {"errors": item["errors"]})
+        if code >= 400:
+            raise ApiError(f"{op}: HTTP {code}", {"http": code, "body": text[:300]})
+        return item.get("data") or {}
+
+    def context(self, currency="TWD"):
+        return {"siteId": 300000045, "locale": "zh_TW", "eapid": 45, "tpid": 3211, "currency": currency,
+                "device": {"type": "DESKTOP"}, "identity": {"duaid": self._duaid, "authState": "AUTHENTICATED"},
+                "privacyTrackingState": "CAN_TRACK"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        if self.br:
+            self.br.close()
+
+
+# --------------------------------------------------------------- parsing
+def date_obj(s):
+    try:
+        y, m, d = s.split("-")
+        return {"year": int(y), "month": int(m), "day": int(d)}
+    except Exception:
+        raise Usage(f"bad date {s!r}, expected YYYY-MM-DD")
+
+
+def build_rooms(adults, children_ages, rooms):
+    adults, rooms = int(adults), int(rooms)
+    if adults < 1 or rooms < 1:
+        raise Usage("--adults and --rooms must be >= 1")
+    base, extra = divmod(adults, rooms)
+    room_list = [{"adults": max(base + (1 if i < extra else 0), 1), "children": []} for i in range(rooms)]
+    # Simplification (undocumented upstream how multi-room child assignment should
+    # split): all requested child ages go into room 1, matching the traveler-selector
+    # UI's own default when you only touch room 1's child stepper (measured live).
+    for age in children_ages or []:
+        room_list[0]["children"].append({"age": int(age)})
+    return room_list
+
+
+def search_criteria(region_id, region_name, checkin, checkout, rooms):
+    return {
+        "primary": {
+            "destination": {"regionName": region_name, "regionId": region_id, "coordinates": None, "mapBounds": None},
+            "rooms": rooms,
+            "dateRange": {"checkInDate": date_obj(checkin), "checkOutDate": date_obj(checkout)},
+        },
+        "secondary": {"counts": [], "booleans": [],
+                      "selections": [{"id": "privacyTrackingState", "value": "CAN_TRACK"}], "ranges": []},
+    }
+
+
+def product_id(ref):
+    ref = str(ref).strip()
+    if re.fullmatch(r"\d+", ref):
+        return ref
+    m = re.search(r"expediaPropertyId=(\d+)", ref)
+    if m:
+        return m.group(1)
+    raise Usage(f"not a hotels.com property id or URL with expediaPropertyId=: {ref!r}")
+
+
+def money(formatted):
+    return num(formatted)
+
+
+def lead_and_total(display_messages):
+    lead = total = None
+    for block in display_messages or []:
+        for li in block.get("lineItems") or []:
+            if li.get("__typename") == "DisplayPrice" and li.get("role") == "LEAD":
+                lead = money(li["price"]["formatted"])
+            elif li.get("value") and "總價" in str(li.get("value")):
+                total = money(li["value"])
+    return lead, total
+
+
+def parse_suggest(d):
+    out = []
+    groups = ((d.get("searchLocation") or {}).get("itemsGroups")) or []
+    for g in groups:
+        for it in g.get("items") or []:
+            if it.get("regionId") is None:
+                continue
+            out.append({"region_id": it.get("regionId"), "name": it.get("primaryText"),
+                       "full_name": it.get("locationFullName"), "area": it.get("secondaryText"),
+                       "type": it.get("geoType"),
+                       "coordinates": it.get("coordinates")})
+    return out
+
+
+def is_sponsored_listing(x):
+    url = ((x.get("cardLink") or {}).get("resource") or {}).get("value") or ""
+    impr = ((x.get("impressionAnalytics") or {}).get("url")) or ""
+    return bool("sponsoredListing=true" in url or "/sponsoredcontent/" in impr)
+
+
+def parse_listing(item, currency):
+    hs = item.get("headingSection") or {}
+    ss = (item.get("summarySections") or [{}])[0]
+    rs = ss.get("reviewSummary") or {}
+    ps = item.get("priceSection") or {}
+    psum = ps.get("priceSummary") or {}
+    lead, total = lead_and_total(psum.get("displayMessages"))
+    reassure = (psum.get("reassuranceMessage") or {}).get("value")
+    free_cancel = None  # not present as a discrete field on the listing card (measured)
+    url = ((item.get("cardLink") or {}).get("resource") or {}).get("value")
+    return {
+        "id": item.get("id"),
+        "name": hs.get("heading"),
+        "area": "; ".join(m.get("text", "") for m in hs.get("messages") or [] if m.get("text")),
+        "rating": money(((rs.get("graphic") or {}).get("text"))),
+        "rating_text": ((rs.get("title") or {}).get("shoppingProductTitle") or {}).get("text"),
+        "reviews": next((num(st.get("shoppingProductTitle", {}).get("text"))
+                         for st in rs.get("subtexts") or []), None),
+        "price_per_night": lead,
+        "price_total": total,
+        "price_basis": "per night (hotels.com's LEAD/starting rate for this party size, the cheapest bookable "
+                       "unit); price_total is hotels.com's own stay total (\"總價\") for that SAME unit - not "
+                       "simply price_per_night*nights (occupancy surcharges land only in the total; measured "
+                       "live on ordinary hotels too). The API does not label whether taxes/fees are included in either figure: a "
+                       "1-night Taipei stay showed NT$4,351/night vs NT$5,025 total, consistent with taxes/fees only in the "
+                       "total but unconfirmed, so compare hotels by price_total. For budget hostels the cheapest unit can be a shared-dorm "
+                       "bed, not a private room - see top-level `price_basis_note` and verify with `hotel <id>`.",
+        "currency": currency,
+        "availability_note": reassure,
+        "free_cancellation": free_cancel,
+        "sponsored": is_sponsored_listing(item),
+        "url": url,
+    }
+
+
+def parse_search_response(data, currency):
+    ps = data.get("propertySearch") or {}
+    raw = ps.get("propertySearchListings") or []
+    sponsored = sum(1 for x in raw if x.get("__typename") != "LodgingCard" or is_sponsored_listing(x))
+    seen, items = set(), []
+    for x in raw:
+        if x.get("__typename") != "LodgingCard":
+            continue
+        if is_sponsored_listing(x):
+            continue
+        pid = x.get("id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        items.append(parse_listing(x, currency))
+    summary = ps.get("summary") or {}
+    return {
+        "items": items, "dropped_sponsored": sponsored,
+        "matched_total": summary.get("matchedPropertiesSize"),
+        "region_id": ((ps.get("criteria") or {}).get("primary") or {}).get("destination", {}).get("regionId"),
+        "raw_count": len(raw),
+    }
+
+
+def parse_rate_plan(rp, currency, policies):
+    pd0 = (rp.get("priceDetails") or [{}])[0]
+    lead, total = lead_and_total((pd0.get("price") or {}).get("displayMessages"))
+    avail = (pd0.get("availability") or {}).get("scarcityMessage")
+    pol = policies[rp.get("__policy_index", 0)] if policies and rp.get("__policy_index", 0) < len(policies) else None
+    cancel_title = (pol or {}).get("title", {}).get("text") if pol else None
+    return {
+        "rate_plan_id": rp.get("id"),
+        "price_per_night": lead,
+        "price_total": total,
+        "currency": currency,
+        "price_basis": "per night / total for the stay, as shown by hotels.com",
+        "availability_note": avail,
+        "cancellation": cancel_title,
+    }
+
+
+def parse_unit(unit, currency):
+    hs = unit.get("headingSection") or unit.get("header") or {}
+    name = hs.get("text") if isinstance(hs, dict) else None
+    features = [f.get("text") for f in unit.get("features") or [] if f.get("text")]
+    sh = unit.get("secondaryHeader") or {}
+    cd = (sh.get("complexDialog") or {}).get("policyContent") or {}
+    policies = cd.get("policies") or []
+    unit_cancel = None
+    for hm in unit.get("highlightedMessages") or []:
+        trig = ((hm or {}).get("trigger") or {})
+        if trig.get("value"):
+            unit_cancel = trig["value"] + (f" ({trig['secondaryValue']})" if trig.get("secondaryValue") else "")
+            break
+    sel = unit.get("primarySelections") or []
+    rate_plans = []
+    for sidx, s in enumerate(sel):
+        pu = s.get("propertyUnit") or {}
+        for i, rp in enumerate(pu.get("ratePlans") or []):
+            rp = dict(rp)
+            rp["__policy_index"] = i
+            parsed = parse_rate_plan(rp, currency, policies)
+            parsed["cancellation"] = parsed["cancellation"] or unit_cancel
+            parsed["payment"] = (rp.get("paymentReassuranceMessage") or {}).get("value")
+            rate_plans.append(parsed)
+    return {"unit_id": unit.get("unitId"), "name": name, "features": features, "rate_plans": rate_plans}
+
+
+def parse_rooms_response(data, currency):
+    po = data.get("propertyOffers") or {}
+    if po.get("categorizedListings") is None:
+        em = (po.get("errorMessage") or {}).get("title", {}).get("text")
+        return {"units": [], "unavailable_reason": em}
+    units = [parse_unit(u, currency) for u in po["categorizedListings"]]
+    return {"units": units, "unavailable_reason": None}
+
+
+def parse_property(data):
+    pi = data.get("propertyInfo") or {}
+    summary = pi.get("summary") or {}
+    amenities = [a.get("text") for a in ((summary.get("amenities") or {}).get("topAmenities") or {}).get(
+        "infoItems") or [] if a.get("text")]
+    save = pi.get("saveTripItem") or {}
+    return {"id": pi.get("id"), "amenities": amenities,
+            "saved": save.get("initialChecked"), "property_id_display": pi.get("propertyIdDisplay")}
+
+
+def parse_ataglance(data):
+    sections = ((data.get("atAGlance") or {}).get("content") or {}).get("sections") or []
+    checkin = checkout = None
+    raw = json.dumps(sections, ensure_ascii=False, separators=(",", ":"))
+    for pair in re.finditer(r'"text":"入住","subText":"([^"]+)"', raw):
+        checkin = pair.group(1)
+    for pair in re.finditer(r'"text":"退房","subText":"([^"]+)"', raw):
+        checkout = pair.group(1)
+    return {"checkin_time": checkin, "checkout_time": checkout}
+
+
+# --------------------------------------------------------------- commands
+def cmd_doctor(args):
+    checks = []
+    st = load_state()
+    checks.append(["state", "ok" if os.path.exists(STATE_FILE) else "-", STATE_FILE])
+    try:
+        ver = _http_json("/json/version")
+        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')}"])
+    except Net as e:
+        checks.append(["cdp", "FAIL", str(e)])
+        payload = err("doctor found problems", EX_NET, checks=checks)
+        return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
+
+    cl = Client(argparse.Namespace(via="http", debug=args.debug), st)
+    try:
+        code, text = cl.http.fetch("GET", ORIGIN + "/", None, None)
+        checks.append(["http", "ok" if code < 400 else "blocked", f"plain HTTPS {code} (graphql is expected to 429)"])
+    except Net as e:
+        checks.append(["http", "-", str(e)])
+
+    cl2 = Client(argparse.Namespace(via="browser", debug=args.debug), st)
+    try:
+        d = cl2.gql("SearchLocationSuggestions", {
+            "context": cl2.context(), "searchLocationCriteria": {"searchTerm": "東京", "lineOfBusiness": "HOTELS",
+            "isDestination": True, "isGroundTransfersAirport": False, "pageLocation": "ENTRY"}},
+            HASH_TYPEAHEAD, CI_LOTUS)
+        n = len(parse_suggest(d))
+        checks.append(["graphql (browser tab)", "ok" if n else "FAIL", f"typeahead 東京: {n} suggestion(s)"])
+    except (Net, ApiError) as e:
+        checks.append(["graphql (browser tab)", "FAIL", str(e)])
+    finally:
+        cl2.__exit__()
+
+    if st.get("cookies"):
+        if _signed_in(st["cookies"]):
+            checks.append(["login", "ok", f"EG_SESSIONTOKEN present via {st.get('source')}"])
+        else:
+            checks.append(["login", "FAIL", "saved cookies have no EG_SESSIONTOKEN - run `hotels login`"])
+    else:
+        checks.append(["login", "-", "not signed in (search/hotel/price work; whoami/saved/trips need login)"])
+    bad = any(c[1] == "FAIL" for c in checks)
+    payload = err("doctor found problems", EX_NET, checks=checks) if bad else ok({"checks": checks})
+    return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
+
+
+def cmd_suggest(args):
+    with Client(args) as cl:
+        d = cl.gql("SearchLocationSuggestions", {
+            "context": cl.context(args.currency),
+            "searchLocationCriteria": {"searchTerm": args.text, "lineOfBusiness": "HOTELS",
+            "isDestination": True, "isGroundTransfersAirport": False, "pageLocation": "ENTRY"}},
+            HASH_TYPEAHEAD, CI_LOTUS)
+    items = parse_suggest(d)[: args.limit]
+    return emit(ok({"query": args.text, "items": items}), args.json, lambda: table(
+        [[i["region_id"], i["name"], i["area"], i["type"]] for i in items],
+        ["region_id", "name", "area", "type"]))
+
+
+def resolve_destination(cl, dest, currency):
+    if re.fullmatch(r"\d+", str(dest)):
+        return str(dest), None
+    d = cl.gql("SearchLocationSuggestions", {
+        "context": cl.context(currency),
+        "searchLocationCriteria": {"searchTerm": dest, "lineOfBusiness": "HOTELS",
+        "isDestination": True, "isGroundTransfersAirport": False, "pageLocation": "ENTRY"}},
+        HASH_TYPEAHEAD, CI_LOTUS)
+    items = parse_suggest(d)
+    if not items:
+        raise ApiError(f"no destination matched {dest!r}")
+    top = items[0]
+    return top["region_id"], top["full_name"]
+
+
+def cmd_search(args):
+    if args.limit < 1 or args.page < 1:
+        raise Usage("--limit and --page must be >= 1")
+    rooms = build_rooms(args.adults, args.children, args.rooms)
+    sort_enum = SORTS[args.sort or "recommended"]
+    selections = [{"id": "sort", "value": sort_enum}]
+    for s in args.stars or []:
+        selections.append({"id": "star", "value": str(int(s) * 10)})
+    if args.free_cancel:
+        selections.append({"id": "propertyCancellation", "value": "FREE_CANCELLATION"})
+    if args.breakfast:
+        selections.append({"id": "mealPlan", "value": "FREE_BREAKFAST"})
+
+    offset = (args.page - 1) * args.limit
+    needed = args.page * args.limit
+
+    def passes_filter(r):
+        if args.min is not None and (r["price_per_night"] is None or r["price_per_night"] < args.min):
+            return False
+        if args.max is not None and (r["price_per_night"] is None or r["price_per_night"] > args.max):
+            return False
+        return True
+
+    with Client(args) as cl:
+        region_id, region_name = resolve_destination(cl, args.destination, args.currency)
+        crit = search_criteria(region_id, region_name, args.checkin, args.checkout, rooms)
+        crit["secondary"]["selections"] = selections
+        remote_page_size = 100
+        collected, raw_fetched = [], 0
+        matched_total = None
+        seen_ids = set()
+
+        while True:
+            crit["secondary"]["counts"] = [{"id": "resultsStartingIndex", "value": raw_fetched},
+                                          {"id": "resultsSize", "value": remote_page_size}]
+            variables = {"isMultiItem": False, "includeMultiItem": False, "context": cl.context(args.currency),
+                        "criteria": crit, "shoppingContext": {"queryTriggeredBy": "sort_applied",
+                        "typeaheadCollationId": None}}
+            data = cl.gql("SearchResultsAndFilters", variables, HASH_SEARCH, CI_SHOP)
+            parsed = parse_search_response(data, args.currency)
+            matched_total = parsed["matched_total"]
+            raw_listings = data.get("propertySearch", {}).get("propertySearchListings") or []
+            batch_raw_count = len(raw_listings)
+
+            for item in parsed["items"]:
+                if item["id"] not in seen_ids:
+                    seen_ids.add(item["id"])
+                    if passes_filter(item):
+                        collected.append(item)
+
+            raw_fetched += batch_raw_count
+            if len(collected) >= needed or batch_raw_count == 0 or raw_fetched >= 400:
+                break
+
+        items = collected[offset: needed]
+    data_out = {"destination": args.destination, "matched_region": region_name or region_id, "region_id": region_id,
+               "checkin": args.checkin, "checkout": args.checkout, "sort": args.sort or "recommended",
+               "page": args.page, "count": len(items), "matched_total": matched_total,
+               "price_basis_note": "every item's price_per_night/price_total come from the same hotels.com "
+                   "LEAD/總價 pair, so price sorts compare like with like (measured monotonic). Low per-night "
+                   "prices at budget properties can be a shared-dorm BED rate, not a private room - hotels.com's "
+                   "own search card carries no structured field to flag that (checked live), so verify with "
+                   "`hotels hotel <id>` (measured: id 134096514 \"To-Fu-rou\" NT$304/night = its \"共用宿舍, "
+                   "僅限女士\" shared dormitory room for this 3-adult+1-child search).",
+               "items": items}
+    return emit(ok(data_out), args.json, lambda: (
+        f"matched: {region_name or region_id} (region {region_id}), {matched_total} properties, page {args.page}\n"
+        + table([[r["id"], clip(r["name"], 40), f"{r['rating']}" if r["rating"] else "",
+                 nt(r["price_per_night"], args.currency), nt(r["price_total"], args.currency),
+                 clip(r["availability_note"] or "", 16), clip(r["area"], 24)]
+                for r in items], ["id", "name", "rating", "nt/night", "total", "note", "area"])))
+
+
+def cmd_hotel(args):
+    pid = product_id(args.ref)
+    rooms = build_rooms(args.adults, args.children, args.rooms)
+    with Client(args) as cl:
+        crit = search_criteria(args.region_id, None, args.checkin, args.checkout, rooms)
+        base_vars = {"context": cl.context(args.currency), "propertyId": pid,
+                    "shoppingContext": {"multiItem": None, "queryTriggeredBy": "OTHER"}, "searchCriteria": crit}
+        prop = parse_property(cl.gql("PropertyDetailsBasicQuery", base_vars, HASH_PROPERTY, CI_SHOP))
+        glance = parse_ataglance(cl.gql("AtAGlanceQuery", {
+            "context": cl.context(args.currency),
+            "productIdentifier": {"id": pid, "type": "PROPERTY_ID",
+            "travelSearchCriteria": {"property": crit}, "shoppingContext": {"multiItem": None, "queryTriggeredBy": "OTHER"}}},
+            HASH_ATAGLANCE, CI_SHOP))
+        rooms_vars = {"context": cl.context(args.currency), "skipRatePlans": False,
+                     "includeStickyBarPriceSummary": False, "propertyId": pid, "searchCriteria": crit,
+                     "shoppingContext": {"multiItem": None, "queryTriggeredBy": "OTHER"},
+                     "travelAdTrackingInfo": None, "searchOffer": None, "referrer": None,
+                     "selectedSavedQuoteInput": None,
+                     "productIdentifier": {"id": pid, "type": "PROPERTY_ID", "travelSearchCriteria": {"property": crit}}}
+        offers = parse_rooms_response(cl.gql("RoomsAndRatesPropertyOffersQuery", rooms_vars, HASH_ROOMS, CI_SHOP),
+                                      args.currency)
+    data_out = {"id": pid, "checkin": args.checkin, "checkout": args.checkout, **prop, **glance, **offers}
+    def human():
+        lines = [f"id {pid}", f"check-in {data_out.get('checkin_time') or '?'}  check-out {data_out.get('checkout_time') or '?'}",
+                 "amenities: " + ", ".join(data_out.get("amenities") or []) or "amenities: -",
+                 f"saved to favourites: {data_out.get('saved')}"]
+        if data_out.get("unavailable_reason"):
+            lines.append("UNAVAILABLE: " + data_out["unavailable_reason"])
+        for u in data_out.get("units") or []:
+            lines.append(f"\n[{u['unit_id']}] {u['name']}")
+            lines.append("  " + " / ".join(u["features"][:6]))
+            for rp in u["rate_plans"]:
+                lines.append(f"  rate {rp['rate_plan_id']}: {nt(rp['price_per_night'], args.currency)}/night, "
+                             f"total {nt(rp['price_total'], args.currency)}  {rp['cancellation'] or ''}  "
+                             f"{rp['availability_note'] or ''}")
+        return "\n".join(lines)
+    return emit(ok(data_out), args.json, human)
+
+
+def cmd_price(args):
+    rooms = build_rooms(args.adults, args.children, args.rooms)
+    rows = []
+    with Client(args) as cl:
+        for ref in args.refs:
+            pid = product_id(ref)
+            crit = search_criteria(args.region_id, None, args.checkin, args.checkout, rooms)
+            rooms_vars = {"context": cl.context(args.currency), "skipRatePlans": False,
+                         "includeStickyBarPriceSummary": False, "propertyId": pid, "searchCriteria": crit,
+                         "shoppingContext": {"multiItem": None, "queryTriggeredBy": "OTHER"},
+                         "travelAdTrackingInfo": None, "searchOffer": None, "referrer": None,
+                         "selectedSavedQuoteInput": None,
+                         "productIdentifier": {"id": pid, "type": "PROPERTY_ID", "travelSearchCriteria": {"property": crit}}}
+            try:
+                offers = parse_rooms_response(
+                    cl.gql("RoomsAndRatesPropertyOffersQuery", rooms_vars, HASH_ROOMS, CI_SHOP), args.currency)
+                prices = [p for u in offers["units"] for rp in u["rate_plans"] for p in [rp["price_per_night"]] if p]
+                rows.append({"id": pid, "found": True, "lowest_price_per_night": min(prices) if prices else None,
+                            "currency": args.currency, "unavailable_reason": offers.get("unavailable_reason"),
+                            "checked_at": int(time.time())})
+            except ApiError as e:
+                rows.append({"id": pid, "found": False, "error": str(e), "checked_at": int(time.time())})
+    return emit(ok(rows), args.json, lambda: table(
+        [[r["id"], nt(r.get("lowest_price_per_night"), args.currency) if r["found"] else "ERR",
+          r.get("unavailable_reason") or r.get("error") or ""] for r in rows],
+        ["id", "lowest/night", "note"]))
+
+
+def cmd_raw(args):
+    url = args.path if args.path.startswith("http") else ORIGIN + "/" + args.path.lstrip("/")
+    u = urllib.parse.urlparse(url)
+    if u.hostname not in ("tw.hotels.com", "hotels.com"):
+        raise Usage("raw only talks to tw.hotels.com")
+    if re.search(r"checkout|book|reservation|payment", u.path, re.I):
+        raise Usage("raw refuses checkout/book/reservation/payment paths")
+    with Client(args) as cl:
+        code, text = cl.fetch("GET", url)
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = text[:20000]
+    return emit(ok({"http": code, "url": url, "body": body}), True)
+
+
+# ---------------------------------------------------------------- session
+def homepage_login_state(cl):
+    """Parse the raw SSR homepage HTML for the signed-in member's display name."""
+    code, html = cl.fetch("GET", ORIGIN + "/")
+    if code >= 400:
+        raise ApiError(f"homepage: HTTP {code}")
+    # Several header buttons share data-testid="header-menu-button" AND the
+    # class "global-navigation-nav-button" (nav menu "旅遊產品", currency
+    # picker, account), so neither alone is unique - re-measured 2026-10-30:
+    # only the account button additionally carries "uitk-button-tertiary-
+    # large-icon" (the earlier regex matched "global-navigation-nav-button"
+    # alone and grabbed the FIRST such button, the nav-menu one - that was
+    # bug #1, now fixed by requiring the large-icon class too).
+    m = re.search(r'<button title="([^"]*)"[^>]*class="[^"]*uitk-button-tertiary-large-icon[^"]*"', html)
+    name = htmllib.unescape(m.group(1)) if m else None
+    return name
+
+
+def login_from_browser(args):
+    _set_cdp(args.cdp)
+    cookies, ua = edge_cookies()
+    if _signed_in(cookies):
+        return cookies, ua
+    br = Browser(args.debug, LOGIN_URL, wait=True)
+    try:
+        br.eval("""
+        (() => {
+          const b = Array.from(document.querySelectorAll('button')).find(x => (x.innerText||'').trim()==='登入');
+          if (b) b.click();
+        })()
+        """)
+        print(f"Sign in to Hotels.com in the new background tab of the browser on {CDP} "
+              f"(switch to it yourself). Waiting up to {args.wait}s...", file=sys.stderr)
+        t0 = time.time()
+        while time.time() - t0 < args.wait:
+            time.sleep(4)
+            cookies, ua = edge_cookies()
+            if _signed_in(cookies):
+                return cookies, ua
+        raise Auth(f"not signed in after {args.wait}s; run `hotels login` again")
+    finally:
+        br.close()
+
+
+def cmd_login(args):
+    if args.from_clipboard or args.cookie_stdin:
+        raw = _clipboard() if args.from_clipboard else \
+            (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
+        cookies = header_to_cookies(clean_cookie(raw))
+        ua = os.environ.get("HOTELS_UA") or DEFAULT_UA
+        src = "clipboard" if args.from_clipboard else "stdin"
+    else:
+        cookies, ua = login_from_browser(args)
+        src = f"browser {CDP}"
+    st = {"cookies": cookies, "ua": ua}
+    cl = Client(argparse.Namespace(via="browser", debug=args.debug, cdp=getattr(args, "cdp", None)), st)
+    try:
+        name = homepage_login_state(cl)
+    finally:
+        cl.__exit__()
+    if not name:
+        raise Auth("session saved but the homepage did not show a signed-in member name - "
+                   "sign-in may not have completed")
+    st2 = load_state()
+    st2.pop("source", None)
+    st2.update(cookies=cookies, ua=ua, cookie_in_keyring=bool(args.keyring), user={"name": name},
+              logged_in_at=int(time.time()), login_source=src)
+    if st2.get("keyring_parts"):
+        keyring_clear(st2["keyring_parts"])
+    st2.pop("keyring_parts", None)
+    st2.pop("keyring_error", None)
+    if args.keyring:
+        st2["keyring_parts"] = keyring_save(cookies)
+        if keyring_load(st2["keyring_parts"]) != cookies:
+            raise Auth("keyring did not return the session it was given; use the state file")
+    save_state(st2)
+    out = {"user": {"name": name}, "stored": "keyring" if args.keyring else STATE_FILE, "cookies": len(cookies)}
+    return emit(ok(out), args.json, lambda: f"signed in as {name}; session ({len(cookies)} cookies) saved to {out['stored']}")
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        keyring_clear(st.get("keyring_parts"))
+    for k in ("cookies", "cookie_in_keyring", "keyring_parts", "keyring_error", "user",
+              "logged_in_at", "login_source", "source", "ua"):
+        st.pop(k, None)
+    save_state(st)
+    return emit(ok({"logged_out": True}), args.json, "session removed")
+
+
+def cmd_whoami(args):
+    st = load_state()
+    if not st.get("cookies") or not _signed_in(st["cookies"]):
+        raise Auth(st.get("keyring_error") or "not signed in - run `hotels login`")
+    with Client(argparse.Namespace(via="browser", debug=args.debug, cdp=None), st) as cl:
+        name = homepage_login_state(cl)
+    if not name:
+        raise Auth("saved session rejected - the homepage no longer shows a signed-in member")
+    out = {"name": name, "source": st.get("source")}
+    return emit(ok(out), args.json, lambda: f"{name}\nsession via {out['source']} (verified against the live homepage)")
+
+
+def _clipboard():
+    for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-o", "-selection", "clipboard"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
+
+
+def _read_cookie_tty():
+    import termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    print("paste the Cookie header, then press Enter (input hidden):", file=sys.stderr)
+    buf = bytearray()
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        while True:
+            ch = os.read(fd, 65536)
+            if not ch:
+                break
+            if b"\x03" in ch:
+                raise KeyboardInterrupt
+            buf += ch
+            if b"\r" in ch or b"\n" in ch:
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        print(file=sys.stderr)
+    return buf.decode("utf-8", "replace").splitlines()[0] if buf else ""
+
+
+# -------------------------------------------------------------- saved/trips
+def cmd_trips(args):
+    st = load_state()
+    if not st.get("cookies") or not _signed_in(st["cookies"]):
+        raise Auth("not signed in - run `hotels login`")
+    with Client(argparse.Namespace(via="browser", debug=args.debug, cdp=None), st) as cl:
+        br = cl.browser()
+        br.navigate(ORIGIN + "/trips")
+        time.sleep(3)
+        tabs = {}
+        for label, key in (("已預訂", "booked"), ("已儲存", "saved")):
+            br.eval("(()=>{const e=[...document.querySelectorAll('[role=tab]')].find(e=>(e.innerText||'').trim()==%s);if(e)e.click()})()" % json.dumps(label))
+            time.sleep(2)
+            tabs[key] = br.eval("document.body.innerText")
+    def empty(t, marker):
+        return marker in t
+    booked_empty = empty(tabs["booked"], "尚無預訂")
+    saved_empty = empty(tabs["saved"], "尚無儲存項目")
+    data = {"booked_empty": booked_empty, "saved_empty": saved_empty,
+            "note": "read-only parse of https://tw.hotels.com/trips tabs 已預訂/已儲存 (the 已過去 tab loads lazily and is not read). "
+                    "Empty states were measured live (尚無預訂 / 尚無儲存項目); the non-empty list shape was never captured, so "
+                    "when not empty only raw text is returned.",
+            "booked_text": None if booked_empty else tabs["booked"][:1500],
+            "saved_text": None if saved_empty else tabs["saved"][:1500]}
+    return emit(ok(data), args.json, lambda: (
+        ("booked: none\n" if booked_empty else "booked:\n" + data["booked_text"] + "\n")
+        + ("saved: none" if saved_empty else "saved:\n" + data["saved_text"])))
+
+
+def cmd_saved(args):
+    st = load_state()
+    if not st.get("cookies") or not _signed_in(st["cookies"]):
+        raise Auth("not signed in - run `hotels login`")
+    if args.action == "list":
+        return cmd_trips(args)
+
+    pid = product_id(args.ref)
+    rooms = build_rooms(2, [], 1)
+    today = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400 * 30))
+    tomorrow = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400 * 33))
+    crit = search_criteria(None, None, today, tomorrow, rooms)
+    url = f"{ORIGIN}/h{pid}.Hotel-Information?expediaPropertyId={pid}"
+    with Client(argparse.Namespace(via="browser", debug=args.debug, cdp=None), st) as cl:
+        base_vars = {"context": cl.context(), "propertyId": pid,
+                    "shoppingContext": {"multiItem": None, "queryTriggeredBy": "OTHER"}, "searchCriteria": crit}
+        before = parse_property(cl.gql("PropertyDetailsBasicQuery", base_vars, HASH_PROPERTY, CI_SHOP))
+        want_saved = args.action == "add"
+        if before.get("saved") == want_saved:
+            return emit(ok({"id": pid, "already": want_saved}), args.json,
+                        f"{pid} is already {'saved' if want_saved else 'not saved'}; nothing to do")
+        if not args.yes:
+            return emit(ok({"dry_run": True, "id": pid, "action": args.action, "currently_saved": before.get("saved")}),
+                        args.json, f"would {args.action} {pid} to favourites (currently saved={before.get('saved')}). "
+                        "re-run with --yes")
+        br = cl.browser()
+        br.p.call("Emulation.setFocusEmulationEnabled", enabled=True)  # our own tab only; renders UI sheets
+        br.navigate(url)
+        time.sleep(4)
+        # The page's own heart button is the source of truth: its aria-label flips between
+        # 將住宿儲存到行程裡 (not saved) and 將住宿從行程中移除 (saved). The GraphQL
+        # saveTripItem.initialChecked stays stale after a click (measured), so it is not used to verify.
+        add_lbl, rm_lbl = "將住宿儲存到行程裡", "將住宿從行程中移除"
+        click_lbl = add_lbl if want_saved else rm_lbl
+        clicked = br.eval("(() => { const b = Array.from(document.querySelectorAll('button')).find(x => "
+                          "(x.getAttribute('aria-label')||'') === %s); if (!b) return false; b.click(); return true; })()"
+                          % json.dumps(click_lbl))
+        if not clicked:
+            raise ApiError("could not find the save/favourite button on the hotel page")
+        if not want_saved:
+            # removing opens a "我的行程" side sheet; the per-trip button there does the actual removal
+            for _ in range(8):
+                time.sleep(1.5)
+                if br.eval("(() => { const b = Array.from(document.querySelectorAll('button')).find(x => "
+                           "/^從.+行程中移除住宿$/.test((x.innerText||'').trim())); if (!b) return false; b.click(); return true; })()"):
+                    break
+        final = None
+        for _ in range(8):
+            time.sleep(1.5)
+            labels = br.eval("JSON.stringify(Array.from(document.querySelectorAll('button')).map(b => b.getAttribute('aria-label')||''))")
+            if (rm_lbl if want_saved else add_lbl) in labels:
+                final = want_saved
+                break
+        if final is None:
+            raise ApiError("clicked the button but the page did not flip to the expected state - check `hotels saved list`")
+        after = {"saved": final}
+    return emit(ok({"id": pid, "saved": after.get("saved"), "verified": True}), args.json,
+                f"{pid} is now {'saved' if after.get('saved') else 'not saved'} (verified)")
+
+
+# ------------------------------------------------------------------ parser
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        emit(err(f"{self.prog}: {message}", EX_USAGE), as_json)
+        if not as_json:
+            self.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def csv_ints(s):
+    return [int(x) for x in str(s).split(",") if x.strip()]
+
+
+def build_parser():
+    p = Parser(prog="hotels", description="Hotels.com Taiwan (tw.hotels.com) from the shell (no booking).")
+    p.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="stable {ok, data|error} envelope")
+    common.add_argument("--debug", action="store_true", help="dump requests to stderr")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="transport: http (plain HTTPS, graphql reliably 429s), "
+                             "browser (Edge background tab), auto (default: try http, fall back)")
+    common.add_argument("--cdp", default=None, help=f"CDP endpoint (default {CDP})")
+    common.add_argument("--currency", default="TWD", help="currency (default TWD; only TWD measured live)")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    sub.add_parser("doctor", parents=[common], help="transport, API reachability, login state"
+                   ).set_defaults(fn=cmd_doctor)
+
+    sg = sub.add_parser("suggest", parents=[common], help="typeahead / region lookup")
+    sg.add_argument("text")
+    sg.add_argument("--limit", type=int, default=10)
+    sg.set_defaults(fn=cmd_suggest)
+
+    s = sub.add_parser("search", parents=[common], help="search hotels")
+    s.add_argument("destination", help="free text or a numeric regionId")
+    s.add_argument("--checkin", required=True)
+    s.add_argument("--checkout", required=True)
+    s.add_argument("--adults", type=int, default=2)
+    s.add_argument("--children", type=csv_ints, default=[], help="ages, comma separated, e.g. 7,4")
+    s.add_argument("--rooms", type=int, default=1)
+    s.add_argument("--sort", choices=list(SORTS))
+    s.add_argument("--page", type=int, default=1)
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--min", type=float, help="min price/night TWD")
+    s.add_argument("--max", type=float, help="max price/night TWD")
+    s.add_argument("--stars", type=csv_ints, default=[], help="e.g. 3,4")
+    s.add_argument("--free-cancel", action="store_true")
+    s.add_argument("--breakfast", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    h = sub.add_parser("hotel", aliases=["rooms"], parents=[common], help="rooms/rates for one hotel")
+    h.add_argument("ref", help="property id or hotels.com URL with expediaPropertyId=")
+    h.add_argument("--checkin", required=True)
+    h.add_argument("--checkout", required=True)
+    h.add_argument("--adults", type=int, default=2)
+    h.add_argument("--children", type=csv_ints, default=[])
+    h.add_argument("--rooms", type=int, default=1)
+    h.add_argument("--region-id", default=None, help="optional, improves accuracy; omit if unknown")
+    h.set_defaults(fn=cmd_hotel)
+
+    pc = sub.add_parser("price", parents=[common], help="lowest nightly price for several hotels")
+    pc.add_argument("refs", nargs="+")
+    pc.add_argument("--checkin", required=True)
+    pc.add_argument("--checkout", required=True)
+    pc.add_argument("--adults", type=int, default=2)
+    pc.add_argument("--children", type=csv_ints, default=[])
+    pc.add_argument("--rooms", type=int, default=1)
+    pc.add_argument("--region-id", default=None)
+    pc.set_defaults(fn=cmd_price)
+
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in hotels.com session")
+    g = lg.add_mutually_exclusive_group()
+    g.add_argument("--from-browser", action="store_true",
+                   help="(default) copy the session from Edge on CDP; opens the sign-in page if needed")
+    g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
+    g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a Cookie header")
+    lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in")
+    lg.add_argument("--keyring", action="store_true", help="store cookies in the OS keyring")
+    lg.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", parents=[common], help="delete the saved session").set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", parents=[common], help="verify the saved session against the live homepage"
+                   ).set_defaults(fn=cmd_whoami)
+
+    sub.add_parser("trips", parents=[common], help="read-only list of trips/bookings (needs login)"
+                   ).set_defaults(fn=cmd_trips)
+
+    sv = sub.add_parser("saved", parents=[common], help="favourites list/add/rm (needs login; no booking)")
+    sv.add_argument("action", choices=["list", "add", "rm"])
+    sv.add_argument("ref", nargs="?", help="add/rm: property id or URL")
+    sv.add_argument("--yes", action="store_true", help="really write; without it only preview")
+    sv.set_defaults(fn=cmd_saved)
+
+    r = sub.add_parser("raw", parents=[common], help="GET passthrough for debugging (JSON out)")
+    r.add_argument("path")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if getattr(args, "cdp", None):
+        _set_cdp(args.cdp)
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
